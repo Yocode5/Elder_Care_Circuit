@@ -1,6 +1,12 @@
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
+#include <HTTPClient.h>
+#include <WiFi.h>
+
+const char* ssid = "SLT-Fiber-2.4G0206";
+const char* password = "haeL6342";
+String apikey = "F9UFCGCW71GLSM5S";
 
 Adafruit_MPU6050 mpu;
 
@@ -8,20 +14,23 @@ Adafruit_MPU6050 mpu;
 const int BUZZER_PIN = 25; 
 
 // ===== Thresholds =====
-const float IMPACT_THRESHOLD = 30.0;   //This will mostly be 3G
+const float IMPACT_THRESHOLD = 30.0;
 const float FREEFALL_THRESHOLD = 3.5;  
 const float GYRO_THRESHOLD = 1.8;      
 const int VERIFICATION_TIME = 2000;
 const int TELEMETRY_INTERVAL = 2000;
-// We need to remove this when we are adding a stop button 
-const int ALERT_DURATION = 10000; // auto stop after 10s
+const int ALERT_DURATION = 10000;
 
-//  Filtering (Just a Simple Low Pass Filter)
+// ===== ThingSpeak Timing (FIXED) =====
+unsigned long lastSendTime = 0;
+const int SEND_INTERVAL = 15000;
+
+// ===== Filtering =====
 float alpha = 0.7;
 float Acc = 0, prevAcc = 0;
 float W = 0, prevW = 0;
 
-// Variables For Detection Logic
+// ===== State Variables =====
 unsigned long impactTime = 0;
 unsigned long lastTelemetryTime = 0;
 unsigned long alertStartTime = 0;
@@ -32,10 +41,37 @@ bool freeFallDetected = false;
 
 float peakG = 0.0;
 
+// ===== ThingSpeak Function =====
+void sendToThingSpeak(float gValue , int fallFlag){
+  if(WiFi.status() == WL_CONNECTED){
+    HTTPClient http;
+
+    String url = "https://api.thingspeak.com/update?api_key=" + apikey +
+                 "&field1=" + String(gValue) +
+                 "&field2=" + String(fallFlag);
+
+    http.begin(url);
+    int httpCode = http.GET();
+
+    Serial.println("ThingSpeak Res : ");
+    Serial.println(httpCode);
+
+    http.end();
+  }
+}
+
 void setup() {
   Serial.begin(115200);
-  Wire.begin(21, 22);
+  WiFi.begin(ssid, password);
 
+  while(WiFi.status() != WL_CONNECTED){
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\n WiFi Connected! Ready for ACTION :)");
+
+  Wire.begin(21, 22);
   pinMode(BUZZER_PIN, OUTPUT);
 
   if (!mpu.begin()) {
@@ -53,11 +89,9 @@ void loop() {
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
 
-  // This is the Acceleration Magnitude (Vector Sum) and Gyro Magnitude (Vector Sum)
   float rawAcc = sqrt(sq(a.acceleration.x) + sq(a.acceleration.y) + sq(a.acceleration.z));
   float rawW   = sqrt(sq(g.gyro.x) + sq(g.gyro.y) + sq(g.gyro.z));
 
-  // ===== FILTER =====
   Acc = alpha * rawAcc + (1 - alpha) * prevAcc;
   W   = alpha * rawW   + (1 - alpha) * prevW;
 
@@ -66,14 +100,19 @@ void loop() {
 
   float currentG = Acc / 9.806;
 
-  //Telemetry System (for debugging and tuning)
   if (millis() - lastTelemetryTime > TELEMETRY_INTERVAL) {
     Serial.print("G Force :  "); Serial.print(currentG);
     Serial.print(" Rotational Velocity: "); Serial.println(W);
     lastTelemetryTime = millis();
   }
 
-  // Fall Detection Logic
+  // ===== Periodic ThingSpeak Update (FIXED) =====
+  if (millis() - lastSendTime > SEND_INTERVAL && !alertActive) {
+    sendToThingSpeak(currentG, 0);
+    lastSendTime = millis();
+  }
+
+  // ===== Fall Detection =====
   if (!alertActive) {
 
     if (Acc < FREEFALL_THRESHOLD) {
@@ -106,6 +145,7 @@ void loop() {
 
         if (fallDetected) {
           triggerAlert();
+          sendToThingSpeak(peakG , 1); // 🚨 instant send
         } else {
           Serial.println("===Not a fall===");
         }
@@ -122,7 +162,7 @@ void loop() {
   delay(20);
 }
 
-// Alert Function
+// ===== Alert =====
 void triggerAlert() {
   alertActive = true;
   alertStartTime = millis();
@@ -134,20 +174,17 @@ void triggerAlert() {
   digitalWrite(BUZZER_PIN, HIGH);
 }
 
-// Emergency State Function (Buzzer Pulsing and Auto Stop)
+// ===== Emergency Mode =====
 void handleEmergencyState() {
 
-  // Auto stop after some time UNTILL WE CONNECT A stop button
   if (millis() - alertStartTime > ALERT_DURATION) {
-    Serial.println("<======= Alert auto-stopped");
+    Serial.println("<======= Alert auto-stopped (EMERGENCY STATE)");
     alertActive = false;
     digitalWrite(BUZZER_PIN, LOW);
     return;
   }
 
-  // Pulsing buzzer
   digitalWrite(BUZZER_PIN, (millis() % 300 < 150) ? HIGH : LOW);
 }
 
-
-//PROTOTYPE V1.0
+//PROTOTYPE V1.9
