@@ -4,9 +4,9 @@
 #include <HTTPClient.h>
 #include <WiFi.h>
 
-const char* ssid = "SLT-Fiber-2.4G0206";
-const char* password = "haeL6342";
-String apikey = "F9UFCGCW71GLSM5S";
+const char* ssid = "WIFI_NAME";
+const char* password = "PW";
+String apikey = "API_KEY";
 
 Adafruit_MPU6050 mpu;
 
