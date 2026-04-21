@@ -9,7 +9,7 @@
 #include <Firebase_ESP_Client.h>
 #include <addons/TokenHelper.h>
 
-// ===== WiFi & ThingSpeak =====
+// WiFi & ThingSpeak
 const char* ssid = "AndroidAP8F02";        
 const char* password = "zkaa3250"; 
 
@@ -20,7 +20,7 @@ WiFiClient client;
 unsigned long lastThingSpeakUpdate = 0;
 const unsigned long updateInterval = 20000; 
 
-// ===== FIREBASE =====
+// FIREBASE
 #define API_KEY "AIzaSyB84bwuO6LXTUUMasOKdjyBsWtBAvdhLQo"
 #define FIREBASE_PROJECT_ID "elder-care-monitoring-db" 
 #define DEVICE_ID "7MOLDH3H3"
@@ -29,7 +29,7 @@ FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
 
-// ===== MAX30102 =====
+// MAX30102
 MAX30105 particleSensor;
 long dcFilter = 0;
 long lastBeat = 0;
@@ -37,19 +37,19 @@ int beatAvg = 75;
 float smoothSpO2 = 98.0;
 bool fingerDetected = false; 
 
-// ===== MPU6050 =====
+// MPU6050
 Adafruit_MPU6050 mpu;
 
-// ===== TEMP SENSOR =====
+// TEMP SENSOR
 const int MAX30205_ADDRESS = 0x48;
 unsigned long lastTempUpdate = 0;
 const unsigned long TEMP_INTERVAL = 5000;
 
-// ===== PINS =====
+// PINS
 const int BUZZER_PIN = 25; 
 const int FSR_PIN = 34;
 
-// ===== THRESHOLDS =====
+// THRESHOLDS
 const float IMPACT_THRESHOLD = 30.0;
 const float FREEFALL_THRESHOLD = 3.5;
 const float GYRO_THRESHOLD = 1.8;
@@ -57,12 +57,12 @@ const int VERIFICATION_TIME = 2000;
 const int TELEMETRY_INTERVAL = 2000;
 const int ALERT_DURATION = 60000;
 
-// ===== FILTER =====
+// FILTER 
 float alpha = 0.7;
 float Acc = 0, prevAcc = 0;
 float W = 0, prevW = 0;
 
-// ===== VARIABLES =====
+// VARIABLES
 unsigned long impactTime = 0;
 unsigned long lastTelemetryTime = 0;
 unsigned long alertStartTime = 0;
@@ -120,7 +120,7 @@ void setup()
 
 void loop()
 {
-  // ===== MAX30102 =====
+  // MAX30102
   long ir = particleSensor.getIR();
   long red = particleSensor.getRed();
   
@@ -168,7 +168,7 @@ void loop()
     }
   }
 
-  // ===== MPU =====
+  // MPU
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
 
@@ -189,7 +189,7 @@ void loop()
     lastTelemetryTime = millis();
   }
 
-  // ===== TEMP SEND =====
+  // TEMP SEND
   if (millis() - lastTempUpdate > TEMP_INTERVAL) {
     float tempC = readBodyTemp();
 
@@ -208,7 +208,6 @@ void loop()
     }
   }
 
-  // ===== REST OF YOUR CODE (UNCHANGED) =====
   if (!alertActive) {
     if (Acc < FREEFALL_THRESHOLD) freeFallDetected = true;
 
@@ -238,7 +237,6 @@ void loop()
     }
 
   } else {
-    // (UNCHANGED — your full emergency logic here)
     handleEmergencyState();
   }
 
