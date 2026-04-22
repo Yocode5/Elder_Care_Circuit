@@ -1,6 +1,6 @@
 const int FSR_PIN = 34;
 
-void steup(){
+void setup(){
     Serial.begin(115200);
 
 }
