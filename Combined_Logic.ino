@@ -77,10 +77,10 @@ const int BUZZER_PIN = 25;
 const int FSR_PIN = 34;
 
 // === THRESHOLDS ===
-const float IMPACT_THRESHOLD = 30.0;
-const float FREEFALL_THRESHOLD = 3.5;
-const float GYRO_THRESHOLD = 1.8;
-const int VERIFICATION_TIME = 2000;
+const float IMPACT_THRESHOLD = 20.0;
+const float FREEFALL_THRESHOLD = 1.2;
+const float GYRO_THRESHOLD = 2.3;
+const int VERIFICATION_TIME = 1000;
 const int TELEMETRY_INTERVAL = 2000;
 const int ALERT_DURATION = 60000;
 
@@ -190,10 +190,16 @@ void loop() {
   // CHECK ALARM FLAGS FROM CORE 0
   if (flag_UploadFallAlert) {
     FirebaseJson status;
+
     status.set("fields/live_status/mapValue/fields/currentSituation/stringValue", "PENDING_RESPONSE");
+
+    status.set("fields/live_status/mapValue/fields/peakG/doubleValue", peakG);
+    status.set("fields/live_status/mapValue/fields/timestamp/integerValue", (double)getEpochMillis());
+
     String devicePath = "devices/" + String(DEVICE_ID);
     Firebase.Firestore.patchDocument(&fbdo, FIREBASE_PROJECT_ID, "", devicePath.c_str(), status.raw(), "live_status");
-    flag_UploadFallAlert = false; 
+
+    flag_UploadFallAlert = false;
   }
 
   if (flag_UploadResolved) {
@@ -212,6 +218,10 @@ void loop() {
   if (flag_UploadTimeout) {
     FirebaseJson status;
     status.set("fields/live_status/mapValue/fields/currentSituation/stringValue", "UNRESPONSIVE");
+
+    status.set("fields/live_status/mapValue/fields/peakG/doubleValue", peakG);
+    status.set("fields/live_status/mapValue/fields/timestamp/integerValue", (double)getEpochMillis());
+
     String devicePath = "devices/" + String(DEVICE_ID);
     Firebase.Firestore.patchDocument(&fbdo, FIREBASE_PROJECT_ID, "", devicePath.c_str(), status.raw(), "live_status");
     flag_UploadTimeout = false; 
@@ -270,7 +280,7 @@ void SensorLoop(void * pvParameters) {
         currentTempF = (currentTempC * 9.0 / 5.0) + 32.0;
         
         // Temp Serial Print
-        Serial.print("🌡️ Body Temp: "); Serial.print(currentTempC, 2); Serial.println(" °C");
+        Serial.print(" Body Temp: "); Serial.print(currentTempC, 2); Serial.println(" °C");
       }
       lastTempUpdate = millis();
     }
@@ -303,8 +313,19 @@ void SensorLoop(void * pvParameters) {
 
         if (millis() - impactTime > VERIFICATION_TIME) {
           bool fallDetected = false;
-          if (isHorizontal || W > GYRO_THRESHOLD) fallDetected = true;
-          if (freeFallDetected && peakG > 2.5) fallDetected = true;
+
+          // 🔥 smarter conditions
+          bool strongImpact = peakG > 2.2;      // lower for forearm
+          bool strongRotation = W > GYRO_THRESHOLD;
+
+          // 🔥 combined logic (balanced)
+          if (
+            (strongImpact && strongRotation) ||   // impact + rotation
+            (freeFallDetected && strongImpact) || // drop + hit
+            (strongImpact && isHorizontal)        // hit + posture change
+          ) {
+            fallDetected = true;
+          }
 
           if (fallDetected) {
             alertActive = true;
@@ -343,7 +364,7 @@ void SensorLoop(void * pvParameters) {
 
       // TIMEOUT EMERGENCY
       if (!emergencyTriggered && millis() - alertStartTime > ALERT_DURATION) {
-        Serial.println("❌ Wearer Unresponsive. Triggering Emergency Protocol!");
+        Serial.println(" Wearer Unresponsive. Triggering Emergency Protocol!");
         emergencyTriggered = true;
         flag_UploadTimeout = true; 
       }
@@ -383,7 +404,7 @@ float readBodyTemp() {
 
 void checkRemoteCommands() {
   if (Firebase.Firestore.getDocument(&fbdo, FIREBASE_PROJECT_ID, "", 
-      ("devices/" + String(DEVICE_ID) + "/commands").c_str())) {
+      ("devices/" + String(DEVICE_ID) + "/commands/action").c_str())) {
 
     FirebaseJson json;
     json.setJsonData(fbdo.payload());
@@ -402,7 +423,7 @@ void checkRemoteCommands() {
 
     Firebase.Firestore.patchDocument(
       &fbdo, FIREBASE_PROJECT_ID, "",
-      ("devices/" + String(DEVICE_ID) + "/commands").c_str(),
+      ("devices/" + String(DEVICE_ID) + "/commands/action").c_str(),
       clearCmd.raw(), "action"
     );
   }
