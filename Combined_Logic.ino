@@ -8,8 +8,36 @@
 
 #include <Firebase_ESP_Client.h>
 #include <addons/TokenHelper.h>
+#include <time.h> // === ADDED FOR NTP TIME ===
 
-// WiFi & ThingSpeak
+// === FUNCTION PROTOTYPES ===
+void SensorLoop(void * pvParameters);
+float readBodyTemp();
+void checkRemoteCommands();
+void resolveIncident();
+void confirmEmergency();
+void falseAlarm();
+void updateStatus(String state);
+unsigned long long getEpochMillis(); // New Time Function
+
+// === DUAL CORE VARIABLES ===
+TaskHandle_t SensorTaskHandle;
+
+volatile float smoothSpO2 = 98.0;
+volatile int beatAvg = 75;
+volatile float currentTempC = -1.0; 
+volatile float currentTempF = -1.0;
+
+volatile float peakG = 0.0;
+volatile bool alertActive = false;
+volatile bool emergencyTriggered = false;
+
+// --- COMMUNICATION FLAGS BETWEEN CORES ---
+volatile bool flag_UploadFallAlert = false;
+volatile bool flag_UploadResolved = false;
+volatile bool flag_UploadTimeout = false;
+
+// === WiFi & ThingSpeak ===
 const char* ssid = "AndroidAP8F02";        
 const char* password = "zkaa3250"; 
 
@@ -20,7 +48,7 @@ WiFiClient client;
 unsigned long lastThingSpeakUpdate = 0;
 const unsigned long updateInterval = 20000; 
 
-// FIREBASE
+// === FIREBASE ===
 #define API_KEY "AIzaSyB84bwuO6LXTUUMasOKdjyBsWtBAvdhLQo"
 #define FIREBASE_PROJECT_ID "elder-care-monitoring-db" 
 #define DEVICE_ID "7MOLDH3H3"
@@ -29,27 +57,26 @@ FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
 
+// === SENSORS ===
 // MAX30102
 MAX30105 particleSensor;
 long dcFilter = 0;
 long lastBeat = 0;
-int beatAvg = 75;
-float smoothSpO2 = 98.0;
 bool fingerDetected = false; 
-
-// MPU6050
-Adafruit_MPU6050 mpu;
 
 // TEMP SENSOR
 const int MAX30205_ADDRESS = 0x48;
 unsigned long lastTempUpdate = 0;
 const unsigned long TEMP_INTERVAL = 5000;
 
-// PINS
+// MPU6050 
+Adafruit_MPU6050 mpu;
+
+// === PINS ===
 const int BUZZER_PIN = 25; 
 const int FSR_PIN = 34;
 
-// THRESHOLDS
+// === THRESHOLDS ===
 const float IMPACT_THRESHOLD = 30.0;
 const float FREEFALL_THRESHOLD = 3.5;
 const float GYRO_THRESHOLD = 1.8;
@@ -57,25 +84,19 @@ const int VERIFICATION_TIME = 2000;
 const int TELEMETRY_INTERVAL = 2000;
 const int ALERT_DURATION = 60000;
 
-// FILTER 
+// === FILTER & VARIABLES ===
 float alpha = 0.7;
 float Acc = 0, prevAcc = 0;
 float W = 0, prevW = 0;
 
-// VARIABLES
 unsigned long impactTime = 0;
 unsigned long lastTelemetryTime = 0;
 unsigned long alertStartTime = 0;
 
 bool verifyingFall = false;
-bool alertActive = false;
 bool freeFallDetected = false;
-bool emergencyTriggered = false;
 
-float peakG = 0.0;
-
-void setup()
-{
+void setup() {
   Serial.begin(115200);
   Wire.begin(21, 22);
 
@@ -83,7 +104,7 @@ void setup()
   pinMode(FSR_PIN, INPUT);
 
   if (!mpu.begin()) {
-    Serial.println("MPU6050 Error!, Check Connection V.1 ERROR");
+    Serial.println("MPU6050 Error!, Check Connection");
     while (1);
   }
 
@@ -107,6 +128,17 @@ void setup()
   }
   Serial.println("\nWiFi connected.");
   
+  // === SYNC NTP TIME ===
+  Serial.print("Syncing real-world time");
+  configTime(0, 0, "pool.ntp.org");
+  time_t now = time(nullptr);
+  while (now < 24 * 3600) {
+    Serial.print(".");
+    delay(500);
+    now = time(nullptr);
+  }
+  Serial.println("\nTime Synced successfully!");
+
   ThingSpeak.begin(client);
 
   config.api_key = API_KEY;
@@ -116,131 +148,222 @@ void setup()
 
   Firebase.begin(&config, &auth);
   Firebase.reconnectWiFi(true);
+
+  // === Start the Fast Hardware Loop on Core 0 ===
+  xTaskCreatePinnedToCore(
+    SensorLoop,         /* Task function. */
+    "SensorTask",       /* String name of task. */
+    10000,              /* Stack size of task */
+    NULL,               /* Parameter of the task */
+    1,                  /* Priority of the task */
+    &SensorTaskHandle,  /* Task handle */
+    0);                 /* Pin task to Core 0 */
+    
+  Serial.println("Dual-Core Processing Started!");
 }
 
-void loop()
-{
-  // MAX30102
-  long ir = particleSensor.getIR();
-  long red = particleSensor.getRed();
+// === CORE 1: INTERNET ONLY (Firebase, ThingSpeak) ===
+void loop() {
   
-  if (ir < 50000) {
-    if (fingerDetected) {
-      Serial.println("Finger not detected");
-      fingerDetected = false;
-    }
-    dcFilter = 0;
-  } else {
-    if (!fingerDetected) {
-      Serial.println("Finger detected");
-      fingerDetected = true;
-    }
-
-    if (dcFilter == 0) dcFilter = ir;
-    dcFilter = (dcFilter * 0.85) + (ir * 0.15); 
-    long acPulse = ir - dcFilter;
-
-    float R = (float)red / (float)ir;
-    float spo2 = 110.0 - 16.0 * R;
-    spo2 = constrain(spo2, 90.0, 100.0);
-    smoothSpO2 = (smoothSpO2 * 0.85) + (spo2 * 0.15);
-
-    if (acPulse > 60 && (millis() - lastBeat > 400)) {
-      long delta = millis() - lastBeat;
-      lastBeat = millis();
-      float bpm = 60000.0 / delta;
-
-      if (bpm > 50 && bpm < 120) {
-        beatAvg = (beatAvg * 0.7) + (bpm * 0.3);
-
-        Serial.print("SpO2: ");
-        Serial.print(smoothSpO2, 1);
-        Serial.print("% \t BPM: ");
-        Serial.println(beatAvg);
-
-        if (millis() - lastThingSpeakUpdate > updateInterval) {
-          ThingSpeak.setField(1, smoothSpO2);
-          ThingSpeak.setField(2, beatAvg);
-          ThingSpeak.writeFields(myChannelNumber, myWriteAPIKey);
-          lastThingSpeakUpdate = millis();
-        }
-      }
-    }
+  // 1. Routine ThingSpeak Upload
+  if (millis() - lastThingSpeakUpdate > updateInterval) {
+    ThingSpeak.setField(1, smoothSpO2);
+    ThingSpeak.setField(2, beatAvg);
+    ThingSpeak.writeFields(myChannelNumber, myWriteAPIKey);
+    lastThingSpeakUpdate = millis();
   }
 
-  // MPU
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
-
-  float rawAcc = sqrt(sq(a.acceleration.x) + sq(a.acceleration.y) + sq(a.acceleration.z));
-  float rawW   = sqrt(sq(g.gyro.x) + sq(g.gyro.y) + sq(g.gyro.z));
-
-  Acc = alpha * rawAcc + (1 - alpha) * prevAcc;
-  W   = alpha * rawW   + (1 - alpha) * prevW;
-
-  prevAcc = Acc;
-  prevW = W;
-
-  float currentG = Acc / 9.806;
-
-  if (millis() - lastTelemetryTime > TELEMETRY_INTERVAL) {
-    Serial.print("G Force :  "); Serial.print(currentG);
-    Serial.print(" Rotational Velocity: "); Serial.println(W);
-    lastTelemetryTime = millis();
-  }
-
-  // TEMP SEND
-  if (millis() - lastTempUpdate > TEMP_INTERVAL) {
-    float tempC = readBodyTemp();
-
-    if (tempC != -1.0) {
-      float tempF = (tempC * 9.0 / 5.0) + 32.0;
-
+  // 2. Routine Firebase Temp Upload
+  static unsigned long lastNetworkTempUpdate = 0;
+  if (millis() - lastNetworkTempUpdate > TEMP_INTERVAL) {
+    if (currentTempC != -1.0) {
       FirebaseJson tempData;
-      tempData.set("fields/temperatureC/doubleValue", tempC);
-      tempData.set("fields/temperatureF/doubleValue", tempF);
-      tempData.set("fields/timestamp/integerValue", millis());
-
+      tempData.set("fields/temperatureC/doubleValue", currentTempC);
+      tempData.set("fields/temperatureF/doubleValue", currentTempF);
+      tempData.set("fields/timestamp/integerValue", (double)getEpochMillis());
       String path = "devices/" + String(DEVICE_ID) + "/telemetry_history";
       Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", path.c_str(), tempData.raw());
-
-      lastTempUpdate = millis();
     }
+    lastNetworkTempUpdate = millis();
   }
 
-  if (!alertActive) {
-    if (Acc < FREEFALL_THRESHOLD) freeFallDetected = true;
+  // CHECK ALARM FLAGS FROM CORE 0
+  if (flag_UploadFallAlert) {
+    FirebaseJson status;
+    status.set("fields/live_status/mapValue/fields/currentSituation/stringValue", "PENDING_RESPONSE");
+    String devicePath = "devices/" + String(DEVICE_ID);
+    Firebase.Firestore.patchDocument(&fbdo, FIREBASE_PROJECT_ID, "", devicePath.c_str(), status.raw(), "live_status");
+    flag_UploadFallAlert = false; 
+  }
 
-    if (Acc > IMPACT_THRESHOLD && !verifyingFall) {
-      Serial.println("IMPACT was detected! V1.0");
-      impactTime = millis();
-      verifyingFall = true;
-      peakG = currentG;
-    }
+  if (flag_UploadResolved) {
+    FirebaseJson incident;
+    incident.set("fields/peakG/doubleValue", peakG);
+    incident.set("fields/status/stringValue", "RESOLVED");
+    incident.set("fields/bpmAtTime/integerValue", beatAvg);
+    incident.set("fields/spo2AtTime/doubleValue", smoothSpO2);
+    incident.set("fields/timestamp/integerValue", (double)getEpochMillis());
+    String path = "devices/" + String(DEVICE_ID) + "/incidents";
+    Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", path.c_str(), incident.raw());
+    updateStatus("STABLE");
+    flag_UploadResolved = false; 
+  }
 
-    if (verifyingFall) {
-      float tilt = atan2(a.acceleration.y, a.acceleration.z) * 180 / PI;
-      bool isHorizontal = abs(tilt) > 30;
+  if (flag_UploadTimeout) {
+    FirebaseJson status;
+    status.set("fields/live_status/mapValue/fields/currentSituation/stringValue", "UNRESPONSIVE");
+    String devicePath = "devices/" + String(DEVICE_ID);
+    Firebase.Firestore.patchDocument(&fbdo, FIREBASE_PROJECT_ID, "", devicePath.c_str(), status.raw(), "live_status");
+    flag_UploadTimeout = false; 
+  }
 
-      if (millis() - impactTime > VERIFICATION_TIME) {
-        bool fallDetected = false;
-
-        if (isHorizontal || W > GYRO_THRESHOLD) fallDetected = true;
-        if (freeFallDetected && peakG > 2.5) fallDetected = true;
-
-        if (fallDetected) triggerAlert();
-        else Serial.println("===Not a fall===");
-
-        verifyingFall = false;
-        freeFallDetected = false;
-      }
-    }
-
-  } else {
-    handleEmergencyState();
+  // Check for remote commands from Firebase (Every 2 seconds)
+  static unsigned long lastCommandCheck = 0;
+  if (millis() - lastCommandCheck > 2000) {
+    checkRemoteCommands(); 
+    lastCommandCheck = millis();
   }
 
   delay(20);
+}
+
+// HARDWARE ONLY (Sensors, Pins, Math)
+void SensorLoop(void * pvParameters) {
+  for(;;) {
+    
+    // MAX30105 SENSOR
+    long ir = particleSensor.getIR();
+    long red = particleSensor.getRed();
+    
+    if (ir < 50000) {
+      if (fingerDetected) { Serial.println("Finger not detected"); fingerDetected = false; }
+      dcFilter = 0;
+    } else {
+      if (!fingerDetected) { Serial.println("Finger detected! Calculating..."); fingerDetected = true; }
+      if (dcFilter == 0) dcFilter = ir;
+      dcFilter = (dcFilter * 0.85) + (ir * 0.15); 
+      long acPulse = ir - dcFilter;
+
+      float R = (float)red / (float)ir;
+      float spo2 = 110.0 - 16.0 * R;
+      smoothSpO2 = (smoothSpO2 * 0.85) + (constrain(spo2, 90.0, 100.0) * 0.15);
+
+      if (acPulse > 60 && (millis() - lastBeat > 400)) {
+        long delta = millis() - lastBeat;
+        lastBeat = millis();
+        float bpm = 60000.0 / delta;
+        
+        if (bpm > 50 && bpm < 120) {
+          beatAvg = (beatAvg * 0.7) + (bpm * 0.3);
+          
+          // Vitals Serial Print
+          Serial.print(" BPM: "); Serial.print(beatAvg);
+          Serial.print(" |  SpO2: "); Serial.print(smoothSpO2, 1); Serial.println("%");
+        }
+      }
+    }
+
+    // TEMPERATURE SENSOR
+    if (millis() - lastTempUpdate > TEMP_INTERVAL) {
+      currentTempC = readBodyTemp(); 
+      if (currentTempC != -1.0) {
+        currentTempF = (currentTempC * 9.0 / 5.0) + 32.0;
+        
+        // Temp Serial Print
+        Serial.print("🌡️ Body Temp: "); Serial.print(currentTempC, 2); Serial.println(" °C");
+      }
+      lastTempUpdate = millis();
+    }
+
+    // MPU6050 & FALL DETECTION
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+
+    float rawAcc = sqrt(sq(a.acceleration.x) + sq(a.acceleration.y) + sq(a.acceleration.z));
+    float rawW   = sqrt(sq(g.gyro.x) + sq(g.gyro.y) + sq(g.gyro.z));
+
+    Acc = alpha * rawAcc + (1 - alpha) * prevAcc;
+    W   = alpha * rawW   + (1 - alpha) * prevW;
+    prevAcc = Acc;
+    prevW = W;
+    float currentG = Acc / 9.806;
+
+    if (!alertActive) {
+      if (Acc < FREEFALL_THRESHOLD) freeFallDetected = true;
+
+      if (Acc > IMPACT_THRESHOLD && !verifyingFall) {
+        impactTime = millis();
+        verifyingFall = true;
+        peakG = currentG;
+      }
+
+      if (verifyingFall) {
+        float tilt = atan2(a.acceleration.y, a.acceleration.z) * 180 / PI;
+        bool isHorizontal = abs(tilt) > 30;
+
+        if (millis() - impactTime > VERIFICATION_TIME) {
+          bool fallDetected = false;
+          if (isHorizontal || W > GYRO_THRESHOLD) fallDetected = true;
+          if (freeFallDetected && peakG > 2.5) fallDetected = true;
+
+          if (fallDetected) {
+            alertActive = true;
+            alertStartTime = millis();
+            emergencyTriggered = false;
+            digitalWrite(BUZZER_PIN, HIGH);
+            flag_UploadFallAlert = true; 
+            Serial.print("FALL CONFIRMED! Peak: "); Serial.println(peakG);
+          }
+          verifyingFall = false;
+          freeFallDetected = false;
+        }
+      }
+    } else {
+      
+      // FSR LOGIC
+      int fsrVal = analogRead(FSR_PIN);
+      
+      // Print FSR value
+      if (millis() % 1000 < 20) {
+        Serial.print("ALARM ACTIVE - Waiting for Cancel. FSR Raw Value: "); 
+        Serial.println(fsrVal);
+      }
+
+      // FSR press value.
+      if (fsrVal > 200) {
+        Serial.println("FSR Pressed! Resolving Alarm...");
+        alertActive = false;
+        emergencyTriggered = false;
+        digitalWrite(BUZZER_PIN, LOW);
+        flag_UploadResolved = true; 
+      } else {
+        // Pulse Buzzer
+        digitalWrite(BUZZER_PIN, (millis() % 300 < 150) ? HIGH : LOW);
+      }
+
+      // TIMEOUT EMERGENCY
+      if (!emergencyTriggered && millis() - alertStartTime > ALERT_DURATION) {
+        Serial.println("❌ Wearer Unresponsive. Triggering Emergency Protocol!");
+        emergencyTriggered = true;
+        flag_UploadTimeout = true; 
+      }
+    }
+
+    if (millis() - lastTelemetryTime > TELEMETRY_INTERVAL) {
+      Serial.print("Monitoring... G Force: "); Serial.print(currentG);
+      Serial.print(" | Rotational Vel: "); Serial.println(W);
+      lastTelemetryTime = millis();
+    }
+
+    vTaskDelay(20 / portTICK_PERIOD_MS);
+  }
+}
+
+// HELPER FUNCTIONS
+unsigned long long getEpochMillis() {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (unsigned long long)(tv.tv_sec) * 1000ULL + (unsigned long long)(tv.tv_usec) / 1000ULL;
 }
 
 float readBodyTemp() {
@@ -258,26 +381,85 @@ float readBodyTemp() {
   return -1.0;
 }
 
-void triggerAlert() {
-  alertActive = true;
-  alertStartTime = millis();
+void checkRemoteCommands() {
+  if (Firebase.Firestore.getDocument(&fbdo, FIREBASE_PROJECT_ID, "", 
+      ("devices/" + String(DEVICE_ID) + "/commands").c_str())) {
+
+    FirebaseJson json;
+    json.setJsonData(fbdo.payload());
+
+    FirebaseJsonData result;
+    json.get(result, "fields/action/stringValue");
+
+    String action = result.stringValue;
+
+    if (action == "RESOLVE") resolveIncident();
+    else if (action == "EMERGENCY_CONFIRMED") confirmEmergency();
+    else if (action == "FALSE_ALARM") falseAlarm();
+
+    FirebaseJson clearCmd;
+    clearCmd.set("fields/action/stringValue", "");
+
+    Firebase.Firestore.patchDocument(
+      &fbdo, FIREBASE_PROJECT_ID, "",
+      ("devices/" + String(DEVICE_ID) + "/commands").c_str(),
+      clearCmd.raw(), "action"
+    );
+  }
+}
+
+void resolveIncident() {
+  alertActive = false;
   emergencyTriggered = false;
+  digitalWrite(BUZZER_PIN, LOW);
 
-  Serial.print("FALL CONFIRMED! Peak: ");
-  Serial.print(peakG);
-  Serial.println(" G");
+  FirebaseJson incident;
+  incident.set("fields/peakG/doubleValue", peakG);
+  incident.set("fields/status/stringValue", "RESOLVED");
+  incident.set("fields/timestamp/integerValue", (double)getEpochMillis());
 
+  String path = "devices/" + String(DEVICE_ID) + "/incidents";
+  Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", path.c_str(), incident.raw());
+
+  updateStatus("STABLE");
+}
+
+void confirmEmergency() {
+  alertActive = false;
+  emergencyTriggered = false;
+  digitalWrite(BUZZER_PIN, LOW);
+
+  FirebaseJson incident;
+  incident.set("fields/peakG/doubleValue", peakG);
+  incident.set("fields/status/stringValue", "EMERGENCY");
+  incident.set("fields/timestamp/integerValue", (double)getEpochMillis());
+
+  String path = "devices/" + String(DEVICE_ID) + "/incidents";
+  Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", path.c_str(), incident.raw());
+
+  updateStatus("STABLE");
+}
+
+void falseAlarm() {
+  alertActive = false;
+  emergencyTriggered = false;
+  digitalWrite(BUZZER_PIN, LOW);
+
+  FirebaseJson incident;
+  incident.set("fields/peakG/doubleValue", peakG);
+  incident.set("fields/status/stringValue", "FALSE_ALARM");
+  incident.set("fields/timestamp/integerValue", (double)getEpochMillis());
+
+  String path = "devices/" + String(DEVICE_ID) + "/incidents";
+  Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", path.c_str(), incident.raw());
+
+  updateStatus("STABLE");
+}
+
+void updateStatus(String state) {
   FirebaseJson status;
-  status.set("fields/live_status/mapValue/fields/currentSituation/stringValue", "PENDING_RESPONSE");
+  status.set("fields/live_status/mapValue/fields/currentSituation/stringValue", state);
 
   String devicePath = "devices/" + String(DEVICE_ID);
   Firebase.Firestore.patchDocument(&fbdo, FIREBASE_PROJECT_ID, "", devicePath.c_str(), status.raw(), "live_status");
-
-  digitalWrite(BUZZER_PIN, HIGH);
 }
-
-void handleEmergencyState() {
-  digitalWrite(BUZZER_PIN, (millis() % 300 < 150) ? HIGH : LOW);
-}
-
-// Prototype V 1.1
