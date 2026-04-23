@@ -75,6 +75,7 @@ Adafruit_MPU6050 mpu;
 // === PINS ===
 const int BUZZER_PIN = 25; 
 const int FSR_PIN = 34;
+const int LED_PIN = 26; //New Led :) eka
 
 // === THRESHOLDS ===
 const float IMPACT_THRESHOLD = 20.0;
@@ -102,6 +103,7 @@ void setup() {
 
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(FSR_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
 
   if (!mpu.begin()) {
     Serial.println("MPU6050 Error!, Check Connection");
@@ -299,6 +301,7 @@ void SensorLoop(void * pvParameters) {
     float currentG = Acc / 9.806;
 
     if (!alertActive) {
+      digitalWrite(LED_PIN, LOW);
       if (Acc < FREEFALL_THRESHOLD) freeFallDetected = true;
 
       if (Acc > IMPACT_THRESHOLD && !verifyingFall) {
@@ -332,6 +335,7 @@ void SensorLoop(void * pvParameters) {
             alertStartTime = millis();
             emergencyTriggered = false;
             digitalWrite(BUZZER_PIN, HIGH);
+            digitalWrite(LED_PIN, HIGH);
             flag_UploadFallAlert = true; 
             Serial.print("FALL CONFIRMED! Peak: "); Serial.println(peakG);
           }
@@ -433,6 +437,7 @@ void resolveIncident() {
   alertActive = false;
   emergencyTriggered = false;
   digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_PIN, LOW);
 
   FirebaseJson incident;
   incident.set("fields/peakG/doubleValue", peakG);
